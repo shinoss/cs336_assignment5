@@ -12,19 +12,18 @@ import modal
 from cs336_alignment.modal_utils import (
     GPU,
     MAX_CONTAINERS,
-    SUNET_ID,
     image,
     quote_command,
     wandb_secret,
 )
 
 
-app = modal.App(f"cs336-a5-supplement-{SUNET_ID}")
+app = modal.App(f"cs336-a5-supplement")
 
 SHARED_VOLUME_NAME = "cs336-a5-supplement"
 SHARED_VOLUME_ENVIRONMENT = "cs336-shared-data"
 SHARED_VOLUME_MOUNT_PATH = "/mnt/cs336-a5-supplement"
-RESULTS_VOLUME_NAME = f"cs336-a5-supplement-results-{SUNET_ID}"
+RESULTS_VOLUME_NAME = f"cs336-a5-supplement-results"
 RESULTS_VOLUME_MOUNT_PATH = "/mnt/cs336-a5-supplement-results"
 
 BASE_MODEL_PATH = f"{SHARED_VOLUME_MOUNT_PATH}/models/Meta-Llama-3.1-8B"

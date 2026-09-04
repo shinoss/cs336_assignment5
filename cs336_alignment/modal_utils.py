@@ -21,25 +21,32 @@ def modal_main(*argv: str) -> None:
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
+from pathlib import Path
 
 import modal
 
 
-SUNET_ID = "TODO"  # NOTE: modal_utils.py should remain unchanged other than adding your SUNET_ID.
-if SUNET_ID == "TODO":
-    raise ValueError("Please set SUNET_ID in cs336_alignment/modal_utils.py before running Modal jobs.")
-
-
-GPU = "B200:2"
-MAX_CONTAINERS = 4
+# Two GPUs are required: CUDA device 0 trains the policy and device 1 runs vLLM.
+# Environment overrides make it easy to use a different GPU type or app name
+# without changing source code.
+GPU = os.environ.get("CS336_MODAL_GPU", "L40S:2")
+MAX_CONTAINERS = int(os.environ.get("CS336_MODAL_MAX_CONTAINERS", "1"))
 REMOTE_ROOT = "/root"
-RUN_TIMEOUT_SECONDS = 60 * 60
-WANDB_SECRET_NAME = "wandb"
+RUN_TIMEOUT_SECONDS = int(
+    os.environ.get("CS336_MODAL_TIMEOUT_SECONDS", str(4 * 60 * 60))
+)
+WANDB_SECRET_NAME = "wandb-secret"
+HF_CACHE_MOUNT_PATH = "/cache/huggingface"
 
-app = modal.App(f"cs336-a5-rlvr-{SUNET_ID}")
+app = modal.App(f"cs336-a5-rlvr")
 wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME)
+hf_cache_volume = modal.Volume.from_name(
+    f"cs336-a5-huggingface-cache",
+    create_if_missing=True,
+)
 
 image = (
     modal.Image.from_registry(
@@ -49,14 +56,17 @@ image = (
     .uv_sync(extras=["gpu"])
     .workdir(REMOTE_ROOT)
     .add_local_dir("cs336_alignment", f"{REMOTE_ROOT}/cs336_alignment")
-    .add_local_dir("data", f"{REMOTE_ROOT}/data")
-    .add_local_dir("experiments", f"{REMOTE_ROOT}/experiments")
+    .add_local_dir("data/gsm8k", f"{REMOTE_ROOT}/data/gsm8k")
     .add_local_dir("scripts", f"{REMOTE_ROOT}/scripts")
     .add_local_file("pyproject.toml", f"{REMOTE_ROOT}/pyproject.toml")
     .add_local_file("uv.lock", f"{REMOTE_ROOT}/uv.lock")
 )
-image = image.add_local_file("AGENTS.md", f"{REMOTE_ROOT}/AGENTS.md")
-image = image.add_local_file("CLAUDE.md", f"{REMOTE_ROOT}/CLAUDE.md")
+for optional_file in ("AGENTS.md", "CLAUDE.md"):
+    if Path(optional_file).is_file():
+        image = image.add_local_file(
+            optional_file,
+            f"{REMOTE_ROOT}/{optional_file}",
+        )
 
 
 def quote_command(command: list[str]) -> str:
@@ -68,12 +78,21 @@ def quote_command(command: list[str]) -> str:
     gpu=GPU,
     timeout=RUN_TIMEOUT_SECONDS,
     max_containers=MAX_CONTAINERS,
+    volumes={HF_CACHE_MOUNT_PATH: hf_cache_volume},
+    env={
+        "HF_HOME": HF_CACHE_MOUNT_PATH,
+        "HF_HUB_CACHE": f"{HF_CACHE_MOUNT_PATH}/hub",
+        "TOKENIZERS_PARALLELISM": "false",
+    },
     secrets=[wandb_secret],
 )
 def run_command(command: list[str]) -> str:
     command_str = quote_command(command)
     print(command_str, flush=True)
-    subprocess.run(command, check=True)
+    try:
+        subprocess.run(command, check=True)
+    finally:
+        hf_cache_volume.commit()
     return command_str
 
 

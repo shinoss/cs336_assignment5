@@ -2,14 +2,13 @@ import argparse
 import importlib
 import json
 import logging
-import sys
 from typing import Any, Callable, Literal
 
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerBase
 
-from .checkpoint import get_model_and_tokenizer
 from .drgrpo_grader import r1_zero_reward_fn
+from .modal_utils import app, submit_commands
 from .vllm_utils import VLLMCompletion, VLLMServer
 
 logger = logging.getLogger(__name__)
@@ -19,6 +18,15 @@ CLIP_VALUES = {
     "gspo": 3e-4,
 }
 
+def get_model_and_tokenizer(model_id_or_dir: str, device: str):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id_or_dir,
+        device_map=device,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager" if device=='cpu' else "flash_attention_2",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir)
+    return model, tokenizer
 
 def initialize_experiment_logging(
     project: str | None,
@@ -144,6 +152,7 @@ def compute_rollout_rewards(
 
     i = 0
     total_reward = 0
+    total_answer_reward = 0
     total_format_reward = 0
 
     for rollout, truth in zip(rollout_responses, repeated_ground_truths):
@@ -151,10 +160,12 @@ def compute_rollout_rewards(
         raw_rewards[i] = r['reward']
         total_reward += r['reward']
         total_format_reward += r['format_reward']
+        total_answer_reward += r['answer_reward']
         i += 1
 
     metadata = {
         "reward": total_reward / num_rollouts,
+        "answer_reward": total_answer_reward / num_rollouts,
         "format_reward": total_format_reward / num_rollouts,
     }
 
@@ -194,6 +205,7 @@ def evaluate_policy(
     ) / len(completions)
     metrics = {
         "reward": reward_metadata["reward"],
+        "answer_reward": reward_metadata["answer_reward"],
         "format_reward": reward_metadata["format_reward"],
         "average_response_length": average_response_length,
     }
@@ -455,7 +467,7 @@ def grpo_train_step(
             microbatch_loss /= gradient_accumulation_steps
         logger.debug("Microbatch loss adjusted: %s", microbatch_loss)
 
-        total_loss += microbatch_loss
+        total_loss += microbatch_loss.detach()
         microbatch_loss.backward()
 
     grads = [p.grad for p in model.parameters() if p.grad is not None]
@@ -471,10 +483,11 @@ def grpo_train_step(
             g *= downscale
 
     optimizer.step()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     metadata = {
         "avg_reward": reward_metadata["reward"],
+        "avg_answer_reward": reward_metadata["answer_reward"],
         "avg_format_reward": reward_metadata["format_reward"],
         "mean_adv": advantage_metadata["mean"],
         "min_adv": advantage_metadata["min"],
@@ -497,6 +510,11 @@ def extract_gsm8k(full_answer: str) -> str:
     num = full_answer.split("####")[-1].strip()
     num = num.replace(",","")
     return num
+
+ANSWER_EXTRACTORS: dict[str, Callable[[str], str]] = {
+    "identity": extract_identity,
+    "gsm8k": extract_gsm8k,
+}
 
 def get_dataset(ds_path: str, n_examples: int, answer_extractor: Callable[[str],str] = extract_identity):
     with open(ds_path) as f:
@@ -539,18 +557,20 @@ def train_grpo(
     rollout_log_interval: int = 40,
     wandb_project: str | None = "cs336-a5-grpo",
     wandb_run_name: str | None = None,
+    num_rollout_steps: int = 50,
     rollout_batch_size: int = 256,
     train_batch_size: int = 256,
     gradient_accumulation_steps: int = 32,
     max_grad_norm: float | None = 1.0,
     sampling_temperature: float = 1.0,
     sampling_max_tokens: int = 512,
+    answer_extractor: Literal["identity", "gsm8k"] = "gsm8k",
+    vllm_gpu_memory_utilization: float = 0.75,
 ) -> None:
     torch.manual_seed(seed)
 
     n_train_examples = 6400
     n_val_examples = 1024
-    num_rollout_steps = 200
     learning_rate = 1e-5
     if group_size <= 0 or rollout_batch_size <= 0 or train_batch_size <= 0:
         raise ValueError("Batch sizes and group_size must be positive")
@@ -566,12 +586,21 @@ def train_grpo(
         )
     if validation_interval <= 0 or rollout_log_interval <= 0:
         raise ValueError("Logging intervals must be positive")
+    if num_rollout_steps <= 0:
+        raise ValueError("num_rollout_steps must be positive")
     if max_grad_norm is not None and max_grad_norm < 0:
         raise ValueError("max_grad_norm must be non-negative")
     if sampling_temperature < 0:
         raise ValueError("sampling_temperature must be non-negative")
     if sampling_max_tokens <= 0:
         raise ValueError("sampling_max_tokens must be positive")
+    if answer_extractor not in ANSWER_EXTRACTORS:
+        raise ValueError(
+            f"Unknown answer extractor {answer_extractor!r}; "
+            f"choose from {sorted(ANSWER_EXTRACTORS)}"
+        )
+    if not 0 < vllm_gpu_memory_utilization <= 1:
+        raise ValueError("vllm_gpu_memory_utilization must be in (0, 1]")
 
     # this is the number of prompts per rollout batch (i.e inference)
     # e.g. if rollout bsz is 256 and group size is 8, then we have 32 prompts
@@ -606,6 +635,8 @@ def train_grpo(
         "importance_reweighting_method": importance_reweighting_method,
         "loss_normalization": loss_normalization,
         "normalization_constant": normalization_constant,
+        "answer_extractor": answer_extractor,
+        "vllm_gpu_memory_utilization": vllm_gpu_memory_utilization,
     }
     wandb, wandb_run = initialize_experiment_logging(
         wandb_project,
@@ -624,7 +655,10 @@ def train_grpo(
     )
 
     # Place vLLM inference model on GPU 1
-    server = VLLMServer(model_id=model_id)
+    server = VLLMServer(
+        model_id=model_id,
+        gpu_memory_utilization=vllm_gpu_memory_utilization,
+    )
     sampling_params = {
         "temperature": sampling_temperature,
         "max_tokens": sampling_max_tokens,
@@ -639,8 +673,17 @@ def train_grpo(
         server.start()
         server.init_weight_sync(train_device)
 
-        train_questions, train_answers = get_dataset(train_path, n_train_examples, extract_gsm8k)
-        valid_questions, valid_answers = get_dataset(valid_path, n_val_examples, extract_gsm8k)
+        extract_answer = ANSWER_EXTRACTORS[answer_extractor]
+        train_questions, train_answers = get_dataset(
+            train_path,
+            n_train_examples,
+            extract_answer,
+        )
+        valid_questions, valid_answers = get_dataset(
+            valid_path,
+            n_val_examples,
+            extract_answer,
+        )
 
         template_name = prompt_path.split("/")[-1]
         logger.info("Using prompt format: %s", template_name)
@@ -652,6 +695,43 @@ def train_grpo(
         templated_validation_inputs = [
             template.replace("{question}", question) for question in valid_questions
         ]
+
+        def run_validation(log_step: int) -> None:
+            server.sync_policy_weights(policy)
+            validation_metrics, validation_completions = evaluate_policy(
+                server,
+                templated_validation_inputs,
+                valid_answers,
+                r1_zero_reward_fn,
+                sampling_params,
+                request_batch_size=rollout_batch_size,
+            )
+            log_metrics(
+                {
+                    "val/reward": validation_metrics["reward"],
+                    "val/format_reward": validation_metrics["format_reward"],
+                    "val/average_response_length": validation_metrics[
+                        "average_response_length"
+                    ],
+                },
+                log_step,
+                wandb_run,
+            )
+            log_rollouts(
+                "val",
+                templated_validation_inputs,
+                [completion.text for completion in validation_completions],
+                valid_answers,
+                r1_zero_reward_fn,
+                log_step,
+                wandb,
+                wandb_run,
+            )
+
+        # Establish a baseline before the first optimizer update.
+        run_validation(log_step=0)
+        last_completed_step = 0
+        last_validation_step = 0
 
         for step in range(num_rollout_steps):
             start = step * prompts_per_batch
@@ -732,6 +812,7 @@ def train_grpo(
                 train_metadata_per_batch.append(train_metadata)
 
             log_step = step + 1
+            last_completed_step = log_step
             mean_metadata = {
                 key: sum(float(metadata[key]) for metadata in train_metadata_per_batch)
                 / len(train_metadata_per_batch)
@@ -783,36 +864,13 @@ def train_grpo(
                 )
 
             if log_step % validation_interval == 0:
-                server.sync_policy_weights(policy)
-                validation_metrics, validation_completions = evaluate_policy(
-                    server,
-                    templated_validation_inputs,
-                    valid_answers,
-                    r1_zero_reward_fn,
-                    sampling_params,
-                    request_batch_size=rollout_batch_size,
-                )
-                log_metrics(
-                    {
-                        "val/reward": validation_metrics["reward"],
-                        "val/format_reward": validation_metrics["format_reward"],
-                        "val/average_response_length": validation_metrics[
-                            "average_response_length"
-                        ],
-                    },
-                    log_step,
-                    wandb_run,
-                )
-                log_rollouts(
-                    "val",
-                    templated_validation_inputs,
-                    [completion.text for completion in validation_completions],
-                    valid_answers,
-                    r1_zero_reward_fn,
-                    log_step,
-                    wandb,
-                    wandb_run,
-                )
+                run_validation(log_step)
+                last_validation_step = log_step
+
+        # Always report the final policy, even when the final step does not land
+        # exactly on validation_interval.
+        if last_completed_step != last_validation_step:
+            run_validation(last_completed_step)
     finally:
         server.stop()
         if wandb_run is not None:
@@ -821,7 +879,7 @@ def train_grpo(
 
 def build_run_commands(args):
     command = [
-        sys.executable,
+        "python",
         "-u",
         "-m",
         "cs336_alignment.grpo",
@@ -851,6 +909,8 @@ def build_run_commands(args):
         str(args.validation_interval),
         "--rollout-log-interval",
         str(args.rollout_log_interval),
+        "--num-rollout-steps",
+        str(args.num_rollout_steps),
         "--rollout-batch-size",
         str(args.rollout_batch_size),
         "--train-batch-size",
@@ -863,6 +923,10 @@ def build_run_commands(args):
         str(args.sampling_temperature),
         "--sampling-max-tokens",
         str(args.sampling_max_tokens),
+        "--answer-extractor",
+        args.answer_extractor,
+        "--vllm-gpu-memory-utilization",
+        str(args.vllm_gpu_memory_utilization),
     ]
     if args.normalization_constant is not None:
         command.extend(
@@ -904,31 +968,33 @@ def make_parser():
     parser.add_argument("--normalization-constant", type=int)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--rollout-log-interval", type=int, default=40)
+    parser.add_argument("--num-rollout-steps", type=int, default=50)
     parser.add_argument("--rollout-batch-size", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--sampling-max-tokens", type=int, default=512)
+    parser.add_argument(
+        "--answer-extractor",
+        choices=sorted(ANSWER_EXTRACTORS),
+        default="gsm8k",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.75,
+    )
     parser.add_argument("--wandb-project", default="cs336-a5-grpo")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--disable-wandb", action="store_true")
     return parser
 
-# from .modal_utils import app, submit_commands
-# @app.local_entrypoint
-# def modal_main(*argv: str) -> None:
-#     args = make_parser().parse_args(list(argv))
-#     commands = build_run_commands(args)
-#     submit_commands(commands)
-
-
-# def get_device():
-#     if torch.backends.mps.is_available():
-#         return "mps"
-#     if torch.cuda.is_available():
-#         return "cuda"
-#     return "cpu"
+@app.local_entrypoint(name="grpo")
+def modal_main(*argv: str) -> None:
+    args = make_parser().parse_args(list(argv))
+    commands = build_run_commands(args)
+    submit_commands(commands)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -950,10 +1016,13 @@ if __name__ == "__main__":
         rollout_log_interval=args.rollout_log_interval,
         wandb_project=None if args.disable_wandb else args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        num_rollout_steps=args.num_rollout_steps,
         rollout_batch_size=args.rollout_batch_size,
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_grad_norm=args.max_grad_norm,
         sampling_temperature=args.sampling_temperature,
         sampling_max_tokens=args.sampling_max_tokens,
+        answer_extractor=args.answer_extractor,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
     )
