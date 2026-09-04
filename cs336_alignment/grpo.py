@@ -259,7 +259,7 @@ def compute_policy_gradient_loss(
     if importance_reweighting_method == "none":
         per_token_policy_gradient_loss = -(policy_log_probs * advantage)
     else:
-        assert old_log_probs is not None
+        assert old_log_probs is not None, "Importance reweighting requires logprobs of original policy"
         log_prob_factor = policy_log_probs - old_log_probs
         reweight_factor = torch.exp(log_prob_factor)
         if importance_reweighting_method == "noclip":
@@ -490,15 +490,38 @@ def grpo_train_step(
     return (total_loss, metadata)
 
 
-def get_dataset(ds_path: str, n_examples: int):
+def extract_identity(ans: str) -> str:
+    return ans
+
+def extract_gsm8k(full_answer: str) -> str:
+    num = full_answer.split("####")[-1].strip()
+    num = num.replace(",","")
+    return num
+
+def get_dataset(ds_path: str, n_examples: int, answer_extractor: Callable[[str],str] = extract_identity):
     with open(ds_path) as f:
         data = [json.loads(line) for line in f if line.strip()]
         questions = [d['question'] for d in data][:n_examples]
-        answers = [d['answer'] for d in data][:n_examples]
+        answers = [answer_extractor(d['answer']) for d in data][:n_examples]
     return questions, answers
 
 
-# full training loop
+def compute_original_logprobs(
+    model: PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizer,
+    prompts: list[str],
+    responses: list[str],
+    device: str,
+) -> torch.Tensor:
+    model.eval()
+    with torch.no_grad():
+        tokenized_result = tokenize_prompt_and_output(prompts, responses, tokenizer)
+        input_ids = tokenized_result["input_ids"].to(device)
+        labels = tokenized_result["labels"].to(device)
+        log_probs = get_response_logprobs(model, input_ids, labels)["log_probs"].detach()
+    model.train()
+    return log_probs
+
 def train_grpo(
     model_id: str,
     train_path: str,
@@ -616,8 +639,8 @@ def train_grpo(
         server.start()
         server.init_weight_sync(train_device)
 
-        train_questions, train_answers = get_dataset(train_path, n_train_examples)
-        valid_questions, valid_answers = get_dataset(valid_path, n_val_examples)
+        train_questions, train_answers = get_dataset(train_path, n_train_examples, extract_gsm8k)
+        valid_questions, valid_answers = get_dataset(valid_path, n_val_examples, extract_gsm8k)
 
         template_name = prompt_path.split("/")[-1]
         logger.info("Using prompt format: %s", template_name)
@@ -664,9 +687,17 @@ def train_grpo(
                     "Rollout prompts, responses, and ground truths are misaligned"
                 )
 
-            # TODO: Compute fixed old-policy log probabilities for the complete
-            # rollout batch here when importance reweighting is enabled.
             old_log_probs = None
+            if importance_reweighting_method != "none":
+                # Compute fixed old-policy log probabilities for completions
+                old_log_probs = compute_original_logprobs(
+                    policy,
+                    tokenizer,
+                    repeated_prompts,
+                    rollout_responses,
+                    train_device,
+                )
+                logger.info(f"[Step {step}] old log probs shape: {old_log_probs.shape}")
 
             policy.train()
             train_losses: list[float] = []
